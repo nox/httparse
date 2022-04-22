@@ -247,10 +247,11 @@ pub struct ParserConfig {
     allow_obsolete_multiline_headers_in_responses: bool,
     allow_multiple_spaces_in_request_line_delimiters: bool,
     allow_multiple_spaces_in_response_status_delimiters: bool,
+    ignore_invalid_header_lines_in_responses: bool,
 }
 
 impl ParserConfig {
-    /// Sets whether spaces should be allowed after header name.
+    /// Sets whether spaces and tabs should be allowed after header names in responses.
     pub fn allow_spaces_after_header_name_in_responses(
         &mut self,
         value: bool,
@@ -359,6 +360,15 @@ impl ParserConfig {
         headers: &'headers mut [MaybeUninit<Header<'buf>>],
     ) -> Result<usize> {
         request.parse_with_config_and_uninit_headers(buf, self, headers)
+    }
+
+    /// Sets whether invalid header lines should be silently ignored in responses.
+    pub fn ignore_invalid_header_lines_in_responses(
+        &mut self,
+        value: bool,
+    ) -> &mut Self {
+        self.ignore_invalid_header_lines_in_responses = value;
+        self
     }
 
     /// Parses a response with the given config.
@@ -935,11 +945,6 @@ fn parse_headers_iter_uninit<'a, 'b>(
             return Err(Error::HeaderName);
         }
 
-        let uninit_header = match iter.next() {
-            Some(header) => header,
-            None => break 'headers
-        };
-
         // parse header name until colon
         let header_name: &str = 'name: loop {
             let mut b = next!(bytes);
@@ -969,7 +974,23 @@ fn parse_headers_iter_uninit<'a, 'b>(
                 }
             }
 
-            return Err(Error::HeaderName);
+            if !config.ignore_invalid_header_lines_in_responses {
+                return Err(Error::HeaderName);
+            }
+
+            while b != b'\n' {
+                b = next!(bytes);
+            }
+
+            count += bytes.pos();
+            bytes.slice();
+
+            continue 'headers;
+        };
+
+        let uninit_header = match iter.next() {
+            Some(header) => header,
+            None => break 'headers
         };
 
         let mut b;
@@ -1629,6 +1650,23 @@ mod tests {
         assert_eq!(response.headers[1].value, &b"baguette"[..]);
     }
 
+    #[test]
+    fn test_ignore_header_line_with_whitespaces_after_header_name() {
+        let mut headers = [EMPTY_HEADER; 2];
+        let mut response = Response::new(&mut headers[..]);
+        let result = ::ParserConfig::default()
+            .ignore_invalid_header_lines_in_responses(true)
+            .parse_response(&mut response, RESPONSE_WITH_WHITESPACE_BETWEEN_HEADER_NAME_AND_COLON);
+
+        assert_eq!(result, Ok(Status::Complete(77)));
+        assert_eq!(response.version.unwrap(), 1);
+        assert_eq!(response.code.unwrap(), 200);
+        assert_eq!(response.reason.unwrap(), "OK");
+        assert_eq!(response.headers.len(), 1);
+        assert_eq!(response.headers[0].name, "Bread");
+        assert_eq!(response.headers[0].value, &b"baguette"[..]);
+    }
+
     static REQUEST_WITH_WHITESPACE_BETWEEN_HEADER_NAME_AND_COLON: &'static [u8] =
         b"GET / HTTP/1.1\r\nHost : localhost\r\n\r\n";
 
@@ -1914,4 +1952,63 @@ mod tests {
 
         assert_eq!(result, Err(::Error::HeaderName));
     }
+
+    #[test]
+    fn test_ignore_header_line_with_invalid_char_after_header_name() {
+        let mut headers = [EMPTY_HEADER; 2];
+        let mut response = Response::new(&mut headers[..]);
+        let result = ::ParserConfig::default()
+            .ignore_invalid_header_lines_in_responses(true)
+            .parse_response(&mut response, RESPONSE_WITH_INVALID_CHAR_BETWEEN_HEADER_NAME_AND_COLON);
+
+        assert_eq!(result, Ok(Status::Complete(77)));
+        assert_eq!(response.version.unwrap(), 1);
+        assert_eq!(response.code.unwrap(), 200);
+        assert_eq!(response.reason.unwrap(), "OK");
+        assert_eq!(response.headers.len(), 1);
+        assert_eq!(response.headers[0].name, "Bread");
+        assert_eq!(response.headers[0].value, &b"baguette"[..]);
+    }
+
+    static RESPONSE_WITH_MISSING_COLON: &'static [u8] =
+        b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Credentials\r\nBread: baguette\r\n\r\n";
+
+    #[test]
+    fn test_ignore_header_line_with_missing_colon() {
+        let mut headers = [EMPTY_HEADER; 2];
+        let mut response = Response::new(&mut headers[..]);
+        let result = ::ParserConfig::default()
+            .ignore_invalid_header_lines_in_responses(true)
+            .parse_response(&mut response, RESPONSE_WITH_MISSING_COLON);
+
+        assert_eq!(result, Ok(Status::Complete(70)));
+        assert_eq!(response.version.unwrap(), 1);
+        assert_eq!(response.code.unwrap(), 200);
+        assert_eq!(response.reason.unwrap(), "OK");
+        assert_eq!(response.headers.len(), 1);
+        assert_eq!(response.headers[0].name, "Bread");
+        assert_eq!(response.headers[0].value, &b"baguette"[..]);
+    }
+
+    static RESPONSE_WITH_INVALID_CHAR_AFTER_WHITESPACE_BETWEEN_HEADER_NAME_AND_COLON: &'static [u8] =
+        b"HTTP/1.1 200 OK\r\nAccess-Control-Allow-Credentials    \xFF: true\r\nBread: baguette\r\n\r\n";
+
+    #[test]
+    fn test_ignore_header_line_with_invalid_char_after_whitespace() {
+        let mut headers = [EMPTY_HEADER; 2];
+        let mut response = Response::new(&mut headers[..]);
+        let result = ::ParserConfig::default()
+            .allow_spaces_after_header_name_in_responses(true)
+            .ignore_invalid_header_lines_in_responses(true)
+            .parse_response(&mut response, RESPONSE_WITH_INVALID_CHAR_AFTER_WHITESPACE_BETWEEN_HEADER_NAME_AND_COLON);
+
+        assert_eq!(result, Ok(Status::Complete(81)));
+        assert_eq!(response.version.unwrap(), 1);
+        assert_eq!(response.code.unwrap(), 200);
+        assert_eq!(response.reason.unwrap(), "OK");
+        assert_eq!(response.headers.len(), 1);
+        assert_eq!(response.headers[0].name, "Bread");
+        assert_eq!(response.headers[0].value, &b"baguette"[..]);
+    }
+
 }
